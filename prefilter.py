@@ -1,24 +1,101 @@
 import pandas as pd
 import argparse
 from pathlib import Path
+import re
 
-# ---- column mapping (edit these if your file uses different headers) ----
-COLS = {
-    "name": ["Name", "Player", "Player Name"],
-    "team": ["Team", "Tm"],
-    "pos":  ["Pos", "Position"],
-    "salary": ["Salary"],
-    "proj": ["Proj", "Projection", "Fpts", "FPTS"],
-    "ceiling": ["Ceiling", "Ceil"],
-    "own": ["Own", "Ownership", "Proj Own", "Ownership %"],
-    "cpt_own": ["CPT Own", "Captain Own", "CPT%", "Captain Ownership"],
-}
+def norm(s: str) -> str:
+    if pd.isna(s):
+        return ""
+    s = str(s).strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
 
-def pick_col(df, options):
-    for c in options:
+def pick_col(df: pd.DataFrame, candidates: list[str]) -> str:
+    for c in candidates:
         if c in df.columns:
             return c
-    raise KeyError(f"Missing expected columns. Looked for: {options}. Found: {list(df.columns)}")
+    raise KeyError(f"Missing expected column. Tried: {candidates}. Found: {list(df.columns)}")
+
+def to_num(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce")
+
+def build_cheatsheet(df: pd.DataFrame) -> pd.DataFrame:
+    name_c = pick_col(df, ["Player", "Name", "Player Name"])
+    team_c = pick_col(df, ["Team", "Tm"])
+    pos_c  = pick_col(df, ["Position", "Pos"])
+    sal_c  = pick_col(df, ["Salary"])
+    proj_c = pick_col(df, ["Proj", "Projection", "FPTS", "Fpts"])
+    ceil_c = pick_col(df, ["Ceiling", "Ceil"])
+    own_c  = pick_col(df, ["Own", "Ownership", "Proj Own", "Ownership %"])
+
+    cpt_c = None
+    for opt in ["CPT Own", "Captain Own", "CPT%", "Captain Ownership"]:
+        if opt in df.columns:
+            cpt_c = opt
+            break
+
+    keep = [name_c, team_c, pos_c, sal_c, proj_c, ceil_c, own_c] + ([cpt_c] if cpt_c else [])
+    x = df[keep].copy()
+
+    x = x.rename(columns={
+        name_c: "player",
+        team_c: "team",
+        pos_c: "pos",
+        sal_c: "salary",
+        proj_c: "proj",
+        ceil_c: "ceiling",
+        own_c: "own",
+        **({cpt_c: "cpt_own"} if cpt_c else {})
+    })
+
+    x["player"] = x["player"].map(norm)
+    x["pos"] = x["pos"].astype(str).str.upper().str.strip()
+
+    for c in ["salary", "proj", "ceiling", "own"] + (["cpt_own"] if "cpt_own" in x.columns else []):
+        x[c] = to_num(x[c])
+
+    x = x.dropna(subset=["player", "team", "pos", "salary", "proj", "ceiling", "own"])
+
+    x["ceil_per_1k"] = x["ceiling"] / (x["salary"] / 1000.0)
+    x["ceiling_leverage"] = x["ceiling"] / x["own"].clip(lower=1.0)
+
+    x["core_score"] = (
+        0.55 * x["ceiling"] +
+        0.25 * x["proj"] +
+        0.20 * x["ceiling_leverage"]
+    )
+
+    x["attachment_score"] = (
+        0.60 * x["ceil_per_1k"] +
+        0.25 * x["ceiling_leverage"] +
+        0.15 * (x["salary"] <= 4400).astype(int) * 10
+    )
+
+    if "cpt_own" in x.columns:
+        x["cpt_band_bonus"] = x["cpt_own"].between(10, 30).astype(int) * 5
+        x["cpt_score"] = (
+            0.65 * x["ceiling"] +
+            0.20 * x["proj"] +
+            0.10 * (x["own"] - x["cpt_own"]) +
+            0.05 * x["cpt_band_bonus"]
+        )
+    else:
+        x["cpt_score"] = 0.70 * x["ceiling"] + 0.30 * x["proj"]
+
+    x["bucket"] = "POOL"
+    own_hi = x["own"].quantile(0.75)
+    ceil_hi = x["ceiling"].quantile(0.75)
+    x.loc[(x["own"] >= own_hi) & (x["ceiling"] >= ceil_hi), "bucket"] = "CORE"
+
+    lev_hi = x["ceiling_leverage"].quantile(0.80)
+    x.loc[x["ceiling_leverage"] >= lev_hi, "bucket"] = "LEVERAGE"
+
+    x.loc[(x["salary"] <= 4400) & (x["ceil_per_1k"] >= x["ceil_per_1k"].quantile(0.70)), "bucket"] = "ATTACHMENT"
+
+    lev_lo = x["ceiling_leverage"].quantile(0.25)
+    x.loc[(x["own"] >= own_hi) & (x["ceiling_leverage"] <= lev_lo), "bucket"] = "FADE"
+
+    return x
 
 def main(csv_path: str, out_dir: str, pool_size: int, cpt_size: int):
     csv_path = Path(csv_path)
@@ -26,93 +103,47 @@ def main(csv_path: str, out_dir: str, pool_size: int, cpt_size: int):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     df = pd.read_csv(csv_path)
+    cheat = build_cheatsheet(df)
 
-    name_c = pick_col(df, COLS["name"])
-    team_c = pick_col(df, COLS["team"])
-    pos_c = pick_col(df, COLS["pos"])
-    sal_c = pick_col(df, COLS["salary"])
-    proj_c = pick_col(df, COLS["proj"])
-    ceil_c = pick_col(df, COLS["ceiling"])
-    own_c = pick_col(df, COLS["own"])
+    core = cheat[cheat["bucket"].eq("CORE")].sort_values("core_score", ascending=False)
+    lev  = cheat[cheat["bucket"].eq("LEVERAGE")].sort_values("core_score", ascending=False)
+    att  = cheat[cheat["bucket"].eq("ATTACHMENT")].sort_values("attachment_score", ascending=False)
 
-    # CPT ownership is optional
-    cpt_col = None
-    try:
-        cpt_col = pick_col(df, COLS["cpt_own"])
-    except Exception:
-        pass
+    pool = pd.concat([
+        core.head(max(6, pool_size // 3)),
+        lev.head(max(6, pool_size // 3)),
+        att.head(max(4, pool_size // 4)),
+    ]).drop_duplicates(subset=["player"])
 
-    work = df[[name_c, team_c, pos_c, sal_c, proj_c, ceil_c, own_c] + ([cpt_col] if cpt_col else [])].copy()
-    work.columns = ["name","team","pos","salary","proj","ceiling","own"] + (["cpt_own"] if cpt_col else [])
-
-    # Clean types
-    for c in ["salary","proj","ceiling","own"] + (["cpt_own"] if "cpt_own" in work.columns else []):
-        work[c] = pd.to_numeric(work[c], errors="coerce")
-
-    work = work.dropna(subset=["name","team","pos","salary","proj","ceiling","own"])
-
-    # --- JBC-style scoring ---
-    # Core score: ceiling with mild ownership tolerance (he doesn't hard-fade chalk)
-    work["ceiling_leverage"] = work["ceiling"] / (work["own"].clip(lower=1.0))  # avoid divide by 0
-    work["core_score"] = (
-        0.60 * work["ceiling"] +
-        0.25 * work["proj"] +
-        0.15 * work["ceiling_leverage"]
-    )
-
-    # Attachment score: cheap TD pieces with ceiling per dollar
-    work["ceiling_per_$1k"] = work["ceiling"] / (work["salary"] / 1000.0)
-    work["attachment_score"] = (
-        0.55 * work["ceiling_per_$1k"] +
-        0.25 * work["ceiling_leverage"] +
-        0.20 * (work["salary"] <= 4400).astype(int) * 10
-    )
-
-    # Captain score: ceiling + (optional) CPT leverage
-    if "cpt_own" in work.columns:
-        # prefer CPT ownership in the ~10-30% band (single-entry sweet spot), but not required
-        work["cpt_band_bonus"] = ((work["cpt_own"].between(10, 30)).astype(int) * 5)
-        work["cpt_score"] = 0.70 * work["ceiling"] + 0.20 * work["proj"] + 0.10 * (work["own"] - work["cpt_own"]) + work["cpt_band_bonus"]
+    if len(pool) < pool_size:
+        topup = cheat.sort_values("core_score", ascending=False)
+        pool = pd.concat([pool, topup]).drop_duplicates(subset=["player"]).head(pool_size)
     else:
-        work["cpt_score"] = 0.75 * work["ceiling"] + 0.25 * work["proj"]
+        pool = pool.head(pool_size)
 
-    # Build pool:
-    # - Take top "core" across all
-    core = work.sort_values("core_score", ascending=False).head(max(8, pool_size // 2))
-    # - Take attachments (cheap/efficient) and union
-    attach = work.sort_values("attachment_score", ascending=False).head(max(6, pool_size - len(core)))
+    cpt_candidates = cheat.copy()
+    cpt_candidates = cpt_candidates[cpt_candidates["salary"] >= 6000] if len(cpt_candidates) else cpt_candidates
+    cpt_pool = cpt_candidates.sort_values("cpt_score", ascending=False).head(cpt_size)
 
-    pool = pd.concat([core, attach]).drop_duplicates(subset=["name"]).sort_values("core_score", ascending=False)
-    pool = pool.head(pool_size)
+    stem = csv_path.stem
+    cheat_path = out_dir / f"{stem}_cheatsheet.csv"
+    pool_path  = out_dir / f"{stem}_player_pool.csv"
+    cpt_path   = out_dir / f"{stem}_captain_pool.csv"
 
-    # Captain pool:
-    cpt_pool = work.sort_values("cpt_score", ascending=False).head(cpt_size)
-
-    # Cheat sheet buckets
-    core_names = set(core["name"].head(8))
-    attach_names = set(attach["name"].head(8))
-    pool["bucket"] = pool["name"].apply(lambda n: "CORE" if n in core_names else ("ATTACHMENT" if n in attach_names else "POOL"))
-
-    # Outputs
-    pool_out = out_dir / f"{csv_path.stem}_player_pool.csv"
-    cpt_out  = out_dir / f"{csv_path.stem}_captain_pool.csv"
-    cheat_out= out_dir / f"{csv_path.stem}_cheatsheet.csv"
-
-    pool.to_csv(pool_out, index=False)
-    cpt_pool.to_csv(cpt_out, index=False)
-    pool.sort_values(["bucket","core_score"], ascending=[True,False]).to_csv(cheat_out, index=False)
+    cheat.sort_values(["bucket", "core_score"], ascending=[True, False]).to_csv(cheat_path, index=False)
+    pool.to_csv(pool_path, index=False)
+    cpt_pool.to_csv(cpt_path, index=False)
 
     print("Wrote:")
-    print(pool_out)
-    print(cpt_out)
-    print(cheat_out)
+    print(" ", cheat_path)
+    print(" ", pool_path)
+    print(" ", cpt_path)
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--csv", required=True, help="Path to projections CSV")
-    ap.add_argument("--out", default="out", help="Output folder")
-    ap.add_argument("--pool_size", type=int, default=16, help="Total players in pool")
-    ap.add_argument("--cpt_size", type=int, default=6, help="Captain pool size")
+    ap.add_argument("--csv", required=True, help="Projections CSV (imported every slate)")
+    ap.add_argument("--out", default="out", help="Output directory")
+    ap.add_argument("--pool_size", type=int, default=16, help="Player pool size (jbc-style 12–18)")
+    ap.add_argument("--cpt_size", type=int, default=6, help="Captain pool size (4–7)")
     args = ap.parse_args()
-
     main(args.csv, args.out, args.pool_size, args.cpt_size)
